@@ -1,1 +1,1 @@
-# IDEA
+# A IDEA method for MMR
