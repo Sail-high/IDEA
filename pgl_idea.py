@@ -204,9 +204,6 @@ class PGL_IDEA(GeneralRecommender):
         self.register_buffer('alphas_cumprod', self._linear_schedule(self.diffusion_steps))  # [0,20], 0 is clean
         # print(self.alphas_cumprod)
 
-        self.gamma1 = config['gamma1']
-        self.gamma2 = config['gamma2']
-
         self.num_sampling_steps = config['diffusion_steps']
 
         self.flag_epoch = 0
@@ -412,7 +409,7 @@ class PGL_IDEA(GeneralRecommender):
         kl_loss = 0.0
 
         if self.use_diffusion and self.denoise_net:
-            diffusion_loss, generated_bpr_loss, kl_loss = self.imagination_diffusion(u_g_embeddings,
+            diffusion_loss, generated_bpr_loss, ndv_loss = self.interest_diffusion(u_g_embeddings,
                             pos_i_id, pos_i_vt, neg_i_g_embeddings,epoch_idx,batch_idx)
 
         batch_mf_loss = self.bpr_loss(u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings)
@@ -420,7 +417,7 @@ class PGL_IDEA(GeneralRecommender):
                      + self.reg_weight * cl_loss \
                      + self.diffusion_loss_weight * diffusion_loss \
                      + self.diff_weight* generated_bpr_loss \
-                     + self.hdv_weight * kl_loss \
+                     + self.hdv_weight * ndv_loss \
 
         return total_loss
 
@@ -473,11 +470,11 @@ class PGL_IDEA(GeneralRecommender):
                     x = predicted_x0  #
         return x
 
-    def imagination_diffusion(self,u_g_embeddings,pos_i_g_embeddings,pos_vt_feat,neg_i_g_embeddings,epoch_idx,batch_idx):
+    def interest_diffusion(self,u_g_embeddings,pos_i_g_embeddings,pos_vt_feat,neg_i_g_embeddings,epoch_idx,batch_idx):
         batch_size = u_g_embeddings.shape[0]
 
         # Local Interest Distribution
-        local_mean,local_variance,max_var, mean_and_var = self.calculate_anchored_variance_random(u_g_embeddings,pos_i_g_embeddings+pos_vt_feat)
+        local_mean,local_variance,max_var, mean_and_var = self.calculate_anchored_variance_invariant(u_g_embeddings,pos_i_g_embeddings+pos_vt_feat)
 
         u_tilde = torch.cat([u_g_embeddings, mean_and_var], dim=1)
 
@@ -505,12 +502,12 @@ class PGL_IDEA(GeneralRecommender):
         mu_social,var_e,var_i = self.compute_social_mean_var(u_g_embeddings,pos_i_g_embeddings+pos_vt_feat,generated_item_emb,neg_scores,neg_i_g_embeddings)
         var_weight = self.cal_var_weight(var_e,var_i)
 
-        # Homophily Distribution Verification
-        kl_loss = self.cal_kl_loss_social_alignment(u_g_embeddings,pos_i_g_embeddings + pos_vt_feat, predicted_x0,neg_i_g_embeddings)
+        # Natural Distribution Verification
+        ndv_loss = self.cal_entropy_loss_global_anchor(u_g_embeddings,pos_i_g_embeddings + pos_vt_feat, predicted_x0,neg_i_g_embeddings)
 
         basic_bpr_loss = -torch.log(torch.sigmoid(mu_social*var_weight * pos_scores - neg_scores)).mean()
 
-        return diffusion_loss, basic_bpr_loss,kl_loss,
+        return diffusion_loss, basic_bpr_loss,ndv_loss,
 
     def cal_var_weight(self,var_e,var_i):
         return torch.exp(-var_e)
@@ -564,75 +561,62 @@ class PGL_IDEA(GeneralRecommender):
 
         return u_sim_mean
 
-    def cal_kl_loss_social_alignment(self, u, pos, gen, neg, k=10):
+    def cal_entropy_loss_global_anchor(self, u, pos, gen, k=10):
+        N = pos.size(0)
+        in_batch_random_indices = torch.randint(0, N, (N, k), device=pos.device)
+        random_user_embs = u[in_batch_random_indices].detach()
+        target_user_embs = u.detach().unsqueeze(1)
+        combined_user_embs = torch.cat([target_user_embs, random_user_embs], dim=1)
 
-        similar_user_indices, similar_user_weights = self.find_similar_users(u, pos, k=k)
+        pos_detached = pos.detach().unsqueeze(2)  # 
+        gen_with_grad = gen.unsqueeze(2)  #
 
-        batch_similar_user_embs = u[similar_user_indices].detach()
+ 
+        Score_Q = torch.bmm(combined_user_embs, pos_detached).squeeze(-1)  # [N, K+1]
 
-        pos_detached = pos.detach().unsqueeze(1)
+        Q_social = F.softmax(Score_Q, dim=1).detach()
+        Log_Q = F.log_softmax(Score_Q, dim=1).detach()
+        H_real = -torch.sum(Q_social * Log_Q, dim=1)
 
-        # [N, K, D] * [N, 1, D] -> [N, K, D] -> Sum(-1) -> [N, K]
-        Score_Q = torch.sum(batch_similar_user_embs * pos_detached, dim=-1).detach()
+        Score_P = torch.bmm(combined_user_embs, gen_with_grad).squeeze(-1)  # [N, K+1]
 
+        P_social = F.softmax(Score_P, dim=1)
+        Log_P = F.log_softmax(Score_P, dim=1)
+        H_est = -torch.sum(P_social * Log_P, dim=1)
 
-        Q_social = F.softmax(Score_Q, dim=1).detach()  # Q_social 是 detach 的
-        Log_Q = F.log_softmax(Score_Q, dim=1)
+        return F.mse_loss(H_est, H_real)
 
-        gen_with_grad = gen.unsqueeze(1)
-
-        # [N, K, D] * [N, 1, D] -> [N, K, D] -> Sum(-1) -> [N, K]
-        Score_P = torch.sum(batch_similar_user_embs.detach() * gen_with_grad, dim=-1)
-
-        Log_P_social = F.log_softmax(Score_P, dim=1)
-
-        kl_loss = F.kl_div(Log_P_social, Q_social, reduction='batchmean')
-
-        P = torch.exp(Log_P_social)
-
-        kl_backward_elements = P * (Log_P_social - Log_Q)
-
-        kl_backward = torch.mean(torch.sum(kl_backward_elements, dim=1))
-
-        return kl_loss + kl_backward
-
-    def calculate_anchored_variance_random(self, u_emb: torch.Tensor, pos_emb: torch.Tensor, k: int = 10, M: int = 32):
+        def calculate_anchored_variance_invariant(self, u_emb: torch.Tensor, pos_emb: torch.Tensor, k: int = 10, M: int = 10):
         N_user, D = u_emb.shape
         N_sample = pos_emb.shape[0]
 
         u_emb_norm = F.normalize(u_emb, p=2, dim=1)  # (N_user, D)
         pos_emb_norm = F.normalize(pos_emb, p=2, dim=1)  # (N_sample, D)
 
-
         random_anchor_indices = torch.randperm(N_sample)[:M].to(u_emb.device)
-
-
         anchor_emb = pos_emb_norm[random_anchor_indices]
 
         sim_anchor_all = torch.matmul(anchor_emb, pos_emb_norm.transpose(0, 1))
-
         _, anchor_indices_k = torch.topk(sim_anchor_all, k=k, dim=1, largest=True)
 
         S_U_P = torch.matmul(u_emb_norm, pos_emb_norm.transpose(0, 1))
-
         flat_indices = anchor_indices_k.flatten()
-
         gathered_flat = S_U_P[:, flat_indices]
-
-
         S_U_R = gathered_flat.view(N_user, M, k)
 
+ 
         anchored_mean = torch.mean(S_U_R, dim=2)
-
         anchored_var, _ = torch.var_mean(S_U_R, dim=2, correction=1)
-
         max_var, _ = torch.max(anchored_var, dim=1, keepdim=True)
 
         mean_expanded = anchored_mean.unsqueeze(-1)
         var_expanded = anchored_var.unsqueeze(-1)
-
+  
         mean_var_stacked = torch.cat([mean_expanded, var_expanded], dim=-1)
+  
+        transformed_features = self.lid_aggregator(mean_var_stacked)
 
-        anchored_features = mean_var_stacked.flatten(start_dim=1)
+        # anchored_features = torch.mean(transformed_features, dim=1)
+        anchored_features = torch.max(transformed_features, dim=1).values
 
-        return anchored_mean, anchored_var, max_var,anchored_features
+        return anchored_mean, anchored_var, max_var, anchored_features
